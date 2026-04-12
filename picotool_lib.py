@@ -107,40 +107,53 @@ class Picotool:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    # -- save -------------------------------------------------------------
+    # -- read / save ------------------------------------------------------
+
+    def read(self, addr, size, progress=None):
+        """Read `size` bytes of memory starting at `addr` and return
+        them as a bytes object.
+
+        progress(current, total): optional callback invoked
+        periodically with byte counts during the read loop.
+
+        Returns the bytes read. Raises PicotoolError on argument
+        errors.
+
+        Bytes-oriented counterpart to save(). Mirrors the read loop
+        in save_command::execute, main.cpp:4602-4615.
+        """
+        if size <= 0:
+            raise PicotoolError('Read range is invalid/empty')
+
+        self.open()
+
+        chunk_size = calculate_chunk_size(size)
+        end = addr + size
+        out = bytearray()
+        base = addr
+        while base < end:
+            if progress is not None:
+                progress(base - addr, size)
+            this_chunk = min(chunk_size, end - base)
+            out.extend(self.conn.read_memory(base, this_chunk))
+            base += this_chunk
+        if progress is not None:
+            progress(size, size)
+        return bytes(out)
 
     def save(self, addr, size, file_path, progress=None):
         """Read `size` bytes of memory starting at `addr` and write
         them to `file_path` as a flat binary.
-
-        progress(current, total): optional callback invoked
-        periodically with byte counts during the read loop.
 
         Returns the number of bytes written. Raises PicotoolError on
         argument errors.
 
         Mirrors save_command::execute (BIN-only path), main.cpp:4495-4625.
         """
-        if size <= 0:
-            raise PicotoolError('Save range is invalid/empty')
-
-        self.open()
-
-        chunk_size = calculate_chunk_size(size)
-        end = addr + size
-
+        data = self.read(addr, size, progress=progress)
         with open(file_path, 'wb') as out:
-            base = addr
-            while base < end:
-                if progress is not None:
-                    progress(base - addr, size)
-                this_chunk = min(chunk_size, end - base)
-                buf = self.conn.read_memory(base, this_chunk)
-                out.write(buf)
-                base += this_chunk
-            if progress is not None:
-                progress(size, size)
-            return out.tell()
+            out.write(data)
+        return len(data)
 
     # -- erase ------------------------------------------------------------
 
@@ -180,18 +193,15 @@ class Picotool:
             progress(total, total)
         return total
 
-    # -- load / verify ----------------------------------------------------
+    # -- write / load / verify --------------------------------------------
     #
-    # `load` and `verify` are exposed as separate methods so a caller
-    # can chain "load then verify" with two distinct progress bars.
-    # Picotool's load_guts (main.cpp:4774-4928) does both phases in
-    # one function; we split them so the CLI doesn't need to know
-    # internal phase boundaries.
+    # `write` (bytes) is the foundation; `load` (file) is a thin wrapper.
+    # Same shape for verify_bytes / verify. The bytes-oriented forms are
+    # what library callers usually want; the file-oriented forms exist
+    # for CLI parity with picotool.
 
     def _read_bin_file(self, file_path):
-        """Helper: read a BIN file, validate it's non-empty and the
-        target range fits in flash. Returns (file_data, range_from,
-        range_to)."""
+        """Helper: read a BIN file, validate it's non-empty."""
         if not os.path.exists(file_path):
             raise PicotoolError('file not found: %s' % file_path)
         with open(file_path, 'rb') as f:
@@ -207,22 +217,25 @@ class Picotool:
                 'range 0x%08x-0x%08x not all in flash' %
                 (range_from, range_to))
 
-    def load(self, file_path, offset=FLASH_START, progress=None):
-        """Load `file_path` (a BIN file) into flash starting at `offset`.
+    def write(self, addr, data, progress=None):
+        """Write `data` bytes to flash starting at `addr`.
 
         Erases the surrounding sectors as needed (with zero-fill for
-        any front/back partial sector), then writes.
+        any front/back partial sector), then writes the data.
 
         progress(current, total): write-phase callback.
 
-        Returns the number of bytes loaded. Raises PicotoolError on
+        Returns the number of bytes written. Raises PicotoolError on
         argument errors.
 
-        Mirrors the write path of load_guts, main.cpp:4845-4888.
+        Bytes-oriented counterpart to load(). Mirrors the write path
+        of load_guts, main.cpp:4845-4888.
         """
-        file_data = self._read_bin_file(file_path)
-        range_from = offset
-        range_to = offset + len(file_data)
+        if not data:
+            raise PicotoolError('Write data is empty')
+
+        range_from = addr
+        range_to = addr + len(data)
         self._check_flash_range(range_from, range_to)
 
         self.open()
@@ -239,42 +252,55 @@ class Picotool:
             # main.cpp:4861-4862 -- read range = batch intersect aligned
             read_from = max(base, aligned_from)
             read_to = min(base + this_batch, aligned_to)
-            file_off = read_from - range_from
-            file_buf = file_data[file_off:file_off + (read_to - read_from)]
+            data_off = read_from - range_from
+            chunk = data[data_off:data_off + (read_to - read_from)]
             # main.cpp:4865-4866 -- zero pad to aligned bounds
             pre_pad = read_from - aligned_from
             post_pad = aligned_to - read_to
-            file_buf = (b'\x00' * pre_pad) + file_buf + (b'\x00' * post_pad)
-            assert len(file_buf) == aligned_len, \
-                'pad mismatch: %d vs %d' % (len(file_buf), aligned_len)
+            buf = (b'\x00' * pre_pad) + chunk + (b'\x00' * post_pad)
+            assert len(buf) == aligned_len, \
+                'pad mismatch: %d vs %d' % (len(buf), aligned_len)
 
             # main.cpp:4876-4878 -- erase + write
             self.conn.flash_erase(aligned_from, aligned_len)
-            self.conn.write(aligned_from, file_buf)
+            self.conn.write(aligned_from, buf)
 
             base = read_to
             if progress is not None:
                 progress(base - range_from, range_to - range_from)
         if progress is not None:
             progress(range_to - range_from, range_to - range_from)
-        return len(file_data)
+        return len(data)
 
-    def verify(self, file_path, offset=FLASH_START, progress=None):
-        """Verify that flash starting at `offset` matches `file_path`.
+    def load(self, file_path, offset=FLASH_START, progress=None):
+        """Load `file_path` (a BIN file) into flash starting at `offset`.
 
-        Reads the device range covered by the file and byte-compares
-        against the file contents.
+        Returns the number of bytes loaded. Raises PicotoolError on
+        argument errors.
+
+        Mirrors the write path of load_guts, main.cpp:4845-4888.
+        """
+        file_data = self._read_bin_file(file_path)
+        return self.write(offset, file_data, progress=progress)
+
+    def verify_bytes(self, addr, expected, progress=None):
+        """Verify that flash starting at `addr` matches `expected` bytes.
+
+        Reads the device range and byte-compares against `expected`.
 
         progress(current, total): callback for the read loop.
 
         Raises PicotoolError on first mismatch (with offset and bytes
         in the message). Returns the number of bytes verified on success.
 
-        Mirrors the verify pass of load_guts, main.cpp:4892-4928.
+        Bytes-oriented counterpart to verify(). Mirrors the verify pass
+        of load_guts, main.cpp:4892-4928.
         """
-        file_data = self._read_bin_file(file_path)
-        range_from = offset
-        range_to = offset + len(file_data)
+        if not expected:
+            raise PicotoolError('Verify data is empty')
+
+        range_from = addr
+        range_to = addr + len(expected)
         self._check_flash_range(range_from, range_to)
 
         self.open()
@@ -283,20 +309,28 @@ class Picotool:
         base = range_from
         while base < range_to:
             this_batch = min(range_to - base, batch_size)
-            file_off = base - range_from
-            file_buf = file_data[file_off:file_off + this_batch]
+            data_off = base - range_from
+            chunk = expected[data_off:data_off + this_batch]
             device_buf = self.conn.read_memory(base, this_batch)
             for i in range(this_batch):
-                if file_buf[i] != device_buf[i]:
+                if chunk[i] != device_buf[i]:
                     raise PicotoolError(
-                        'verify failed at 0x%x: file=0x%02x device=0x%02x'
-                        % (base + i, file_buf[i], device_buf[i]))
+                        'verify failed at 0x%x: expected 0x%02x device 0x%02x'
+                        % (base + i, chunk[i], device_buf[i]))
             base += this_batch
             if progress is not None:
                 progress(base - range_from, range_to - range_from)
         if progress is not None:
             progress(range_to - range_from, range_to - range_from)
-        return len(file_data)
+        return len(expected)
+
+    def verify(self, file_path, offset=FLASH_START, progress=None):
+        """Verify that flash starting at `offset` matches `file_path`.
+
+        Mirrors the verify pass of load_guts, main.cpp:4892-4928.
+        """
+        file_data = self._read_bin_file(file_path)
+        return self.verify_bytes(offset, file_data, progress=progress)
 
     # -- reboot -----------------------------------------------------------
 
