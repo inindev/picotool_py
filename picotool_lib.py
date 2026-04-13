@@ -29,6 +29,8 @@ shelling out to picotool.
 
 import os
 
+import time
+
 from _wire import (
     CommandFailure,
     ConnectionError,
@@ -40,9 +42,12 @@ from _wire import (
     REBOOT2_FLAG_REBOOT_TO_ARM,
     REBOOT2_FLAG_REBOOT_TO_RISCV,
     REBOOT2_FLAG_REBOOT_TYPE_BOOTSEL,
+    REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE,
     REBOOT2_FLAG_REBOOT_TYPE_NORMAL,
     calculate_chunk_size,
     find_device,
+    find_stdio_usb_device,
+    force_reboot_to_bootsel,
 )
 from _binary_info import parse_binary_info
 from _uf2 import (
@@ -119,6 +124,32 @@ class Picotool:
         self.conn = None
         self.dev = None
         self.family = None
+
+    def force_into_bootsel(self, wait=True):
+        """Force-reboot a running device into BOOTSEL mode.
+
+        The device must be running firmware that links pico_stdio_usb
+        (which exposes the USB reset interface). This does NOT require
+        the device to already be in BOOTSEL mode.
+
+        If `wait` is True (default), sleeps 1.2s after the reboot to
+        let the device re-enumerate in BOOTSEL mode, matching
+        main.cpp:8838.
+
+        After this call, the device is in BOOTSEL and can be opened
+        with open().
+
+        Mirrors the --force path in main.cpp:8795-8844."""
+        # Close any existing connection first
+        self.close()
+
+        dev, family, intf_num = find_stdio_usb_device(self.serial)
+        self.family = family
+        force_reboot_to_bootsel(dev, intf_num, disable_mask=1)
+
+        if wait:
+            # main.cpp:8838 -- sleep 1200ms for device to re-enumerate
+            time.sleep(1.2)
 
     def __enter__(self):
         self.open()
@@ -516,7 +547,7 @@ class Picotool:
         return len(data)
 
     def load(self, file_path, offset=FLASH_START, file_type=None,
-             family_id=None, progress=None):
+             family_id=None, execute=False, progress=None):
         """Load a BIN or UF2 file into flash.
 
         For BIN files, writes starting at `offset` (default FLASH_START).
@@ -527,6 +558,9 @@ class Picotool:
                        if None. Mirrors C++ -t/--type flag (main.cpp:703).
         `family_id` -- for UF2 files, restrict to this family ID.
                        Mirrors C++ --family flag (main.cpp:849-850).
+        `execute`   -- if True, reboot the device into the loaded program
+                       after writing. Mirrors C++ -x/--execute flag
+                       (main.cpp:4929-4966).
 
         Returns the number of bytes loaded. Raises PicotoolError on
         argument errors.
@@ -545,10 +579,54 @@ class Picotool:
                     file_path, valid_families=valid)
             except UF2Error as e:
                 raise PicotoolError('UF2 parse error: %s' % e)
-            return self.write(addr_min, bytes(image), progress=progress)
+            n = self.write(addr_min, bytes(image), progress=progress)
+            load_addr = addr_min
         else:
             file_data = self._read_bin_file(file_path)
-            return self.write(offset, file_data, progress=progress)
+            n = self.write(offset, file_data, progress=progress)
+            load_addr = offset
+
+        if execute:
+            self._execute_loaded(load_addr)
+
+        return n
+
+    def _execute_loaded(self, load_addr):
+        """Reboot into the program loaded at `load_addr`.
+
+        For flash addresses on RP2350: uses PC_REBOOT2 with
+        REBOOT_TYPE_FLASH_UPDATE (0x4), param0 = load_addr.
+        For flash addresses on RP2040: uses legacy PC_REBOOT with
+        pc=0 (normal boot path).
+
+        Mirrors main.cpp:4929-4966 (execute path in load_guts)."""
+        self.open()
+        if FLASH_START <= load_addr < FLASH_END:
+            if self.family == 'rp2350':
+                # main.cpp:4937-4940 -- flash binary, REBOOT2
+                self.conn.reboot2(
+                    flags=REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE,
+                    delay_ms=500,
+                    param0=load_addr,
+                    param1=0,
+                )
+            else:
+                # main.cpp:4961 -- flash binary on RP2040, pc=0
+                self.conn.reboot(0, 0x20042000, 500)
+        else:
+            if self.family == 'rp2350':
+                # main.cpp:4942-4955 -- RAM binary, REBOOT2
+                # RP2350 SRAM ends at 0x20082000 (model/addresses.h)
+                sram_end = 0x20082000
+                self.conn.reboot2(
+                    flags=REBOOT2_FLAG_REBOOT_TYPE_RAM_IMAGE,
+                    delay_ms=500,
+                    param0=load_addr,
+                    param1=sram_end - load_addr,
+                )
+            else:
+                # main.cpp:4961 -- RAM binary on RP2040
+                self.conn.reboot(load_addr, 0x20042000, 500)
 
     def verify_bytes(self, addr, expected, progress=None):
         """Verify that flash starting at `addr` matches `expected` bytes.

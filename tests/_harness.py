@@ -68,6 +68,16 @@ def has_bootsel_device():
         return False
 
 
+def has_stdio_usb_device():
+    """True if a Pico running pico_stdio_usb is connected (not BOOTSEL)."""
+    try:
+        from _wire import find_stdio_usb_device
+        find_stdio_usb_device()
+        return True
+    except Exception:
+        return False
+
+
 # Cached flash geometry, populated on first call to get_test_region().
 _flash_size = None
 

@@ -266,9 +266,13 @@ def cli_load(args):
                 lambda prog: pt.load(args.file, offset=offset,
                                      file_type=args.type,
                                      family_id=args.family_id,
+                                     execute=args.execute,
                                      progress=prog),
             )
-            if args.verify:
+            if args.execute:
+                # main.cpp:4964
+                print('The device was rebooted to start the application.')
+            if args.verify and not args.execute:
                 try:
                     _with_bar(
                         'Verifying Flash: ',
@@ -307,17 +311,34 @@ def cli_verify(args):
 
 def cli_reboot(args):
     try:
-        with Picotool(serial=args.serial) as pt:
-            cpu = args.cpu if hasattr(args, 'cpu') and args.cpu else None
-            diag = args.diagnostic if hasattr(args, 'diagnostic') and \
-                args.diagnostic is not None else None
+        pt = Picotool(serial=args.serial)
+        cpu = args.cpu if hasattr(args, 'cpu') and args.cpu else None
+        diag = args.diagnostic if hasattr(args, 'diagnostic') and \
+            args.diagnostic is not None else None
+
+        if args.force:
+            # main.cpp:8795-8844 -- force-reboot a running device
+            # into BOOTSEL via the stdio_usb reset interface, then
+            # reboot back to application (or stay in BOOTSEL with -u).
+            pt.force_into_bootsel()
+            if args.usb:
+                print('The device was rebooted into BOOTSEL mode.')
+            else:
+                # Device is now in BOOTSEL; reboot it into the app
+                pt.open()
+                pt.reboot(cpu=cpu, diagnostic_partition=diag)
+                pt.close()
+                print('The device was rebooted into application mode.')
+        else:
+            # Normal reboot (device must already be in BOOTSEL)
+            pt.open()
             if args.usb:
                 pt.reboot(to_bootsel=True, cpu=cpu)
-                # main.cpp:8588
                 print('The device was rebooted into BOOTSEL mode.')
             else:
                 pt.reboot(cpu=cpu, diagnostic_partition=diag)
                 print('The device was rebooted into application mode.')
+            pt.close()
     except (PicotoolError, ConnectionError, CommandFailure) as e:
         _bail(e)
 
@@ -403,6 +424,9 @@ def main():
                         help='Load offset for BIN files (default 0x10000000)')
     p_load.add_argument('-v', '--verify', action='store_true',
                         help='Verify the data was written correctly')
+    # main.cpp:857 -- execute after load
+    p_load.add_argument('-x', '--execute', action='store_true',
+                        help='Reboot into the loaded program after writing')
     # main.cpp:703 -- explicit file type override
     p_load.add_argument('-t', '--type', choices=['uf2', 'bin'],
                         default=None,
@@ -440,6 +464,10 @@ def main():
     p_reboot.add_argument('-g', '--diagnostic', type=int, default=None,
                           metavar='partition',
                           help='Specify diagnostic partition (-3 to 15)')
+    # main.cpp:613 -- force reboot of a running device (not in BOOTSEL)
+    p_reboot.add_argument('-f', '--force', action='store_true',
+                          help='Force a running device (with stdio_usb) '
+                               'to reboot without the BOOTSEL button')
 
     args = parser.parse_args()
 

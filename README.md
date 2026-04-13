@@ -15,14 +15,16 @@ The implemented commands are byte-equivalent to the C++ tool on the same hardwar
 | `erase` | `picotool erase` | Default: erases entire flash (detects size) |
 | `erase -r FROM TO` | `picotool erase --range FROM TO` | Erases an address range; auto-rounds outward to 4 KB sector boundaries |
 | `load FILE [-o OFFSET] [-v]` | `picotool load FILE [-o OFFSET] [-v]` | BIN or UF2 input (auto-detected). UF2 files use embedded target addresses; `-o` applies to BIN only |
+| `load FILE -x` | `picotool load FILE --execute` | Load then reboot into the loaded program (REBOOT_TYPE_FLASH_UPDATE on RP2350) |
 | `verify FILE [-o OFFSET]` | `picotool verify FILE [-o OFFSET]` | Standalone verify; BIN or UF2 input |
 | `reboot` | `picotool reboot` | Reboots into application mode (PC_REBOOT2 on RP2350, PC_REBOOT on RP2040) |
 | `reboot -u` | `picotool reboot --usb` | Reboots into BOOTSEL mode (RP2350 only via PC_REBOOT2) |
+| `reboot -f` | `picotool reboot --force` | Force-reboot a running device (with pico_stdio_usb) into BOOTSEL without the physical button |
 | `reboot -c arm\|riscv` | `picotool reboot --cpu arm\|riscv` | Select CPU architecture on RP2350 |
 
 Additional CLI flags: `--ser` (device serial filter), `save --verify`, `save --family`, `load --type`, `load --family`, `reboot --diagnostic`.
 
-**Out of scope** (use real picotool if you need these): ELF input, partition tables, signed images, `--execute`, `--no-overwrite`, `--update`, OTP read/write, pin info display, `-f` force-reboot running apps, `config`, `seal`, `encrypt`, `link`.
+**Out of scope** (use real picotool if you need these): ELF input, partition tables, signed images, `--no-overwrite`, `--update`, OTP read/write, pin info display, `config`, `seal`, `encrypt`, `link`.
 
 ## Requirements
 
@@ -160,6 +162,9 @@ with Picotool() as pt:
     # load a BIN file at a specific offset
     pt.load('app.bin', offset=0x10040000)
 
+    # load and immediately execute (reboot into the loaded program)
+    pt.load('app.uf2', execute=True)
+
     # verify the load was successful
     pt.verify('app.uf2')
 
@@ -183,6 +188,12 @@ with Picotool() as pt:
 
     # reboot with CPU selection (RP2350)
     pt.reboot(cpu='riscv')
+
+# Force a running device (not in BOOTSEL) into BOOTSEL mode.
+# Requires firmware that links pico_stdio_usb.
+pt = Picotool()
+pt.force_into_bootsel()
+pt.open()  # now in BOOTSEL, ready for commands
 ```
 
 Offline file inspection (no device needed):
@@ -201,17 +212,18 @@ if info:
 | `info(progress=None)` | `BinaryInfo` or `None` | Read binary_info metadata from device |
 | `info_file(file_path)` | `BinaryInfo` or `None` | Parse binary_info from a BIN or UF2 file (no device) |
 | `read(addr, size, progress=None)` | `bytes` | Read raw bytes from memory |
-| `save(addr, size, file_path, progress=None)` | bytes written | Save a range to a BIN file |
+| `save(addr, size, file_path, file_type=None, family_id=None, progress=None)` | bytes written | Save a range to BIN or UF2 |
 | `save_program(file_path, file_type=None, family_id=None, progress=None)` | bytes written | Save the program (extent from binary_info). BIN or UF2 |
 | `save_all(file_path, file_type=None, family_id=None, progress=None)` | bytes written | Save entire flash. BIN or UF2 |
 | `erase(addr, size, progress=None)` | bytes erased | Erase sectors covering a range (auto-rounds to 4 KB) |
 | `erase_all(progress=None)` | bytes erased | Erase entire flash (detects size) |
 | `write(addr, data, progress=None)` | bytes written | Write raw bytes to flash (erases sectors as needed) |
-| `load(file_path, offset=FLASH_START, file_type=None, family_id=None, progress=None)` | bytes loaded | Load a BIN or UF2 file |
+| `load(file_path, offset=FLASH_START, file_type=None, family_id=None, execute=False, progress=None)` | bytes loaded | Load a BIN or UF2 file; `execute=True` reboots into it |
 | `verify(file_path, offset=FLASH_START, file_type=None, progress=None)` | bytes verified | Verify flash matches a file |
 | `verify_bytes(addr, expected, progress=None)` | bytes verified | Verify flash matches raw bytes |
 | `guess_flash_size()` | int | Detect flash size via address mirroring (0 if erased) |
 | `reboot(to_bootsel=False, cpu=None, diagnostic_partition=None)` | None | Reboot device |
+| `force_into_bootsel(wait=True)` | None | Force a running pico_stdio_usb device into BOOTSEL |
 | `open()` / `close()` | None | Manual lifecycle (prefer context manager) |
 
 `progress(current, total)` is an optional callback called periodically with byte counts during long operations. Pass `None` (the default) for silent operation, or wire up your own progress UI. The CLI uses `_wire.ProgressBar.progress` as the callback.
@@ -307,7 +319,7 @@ Within the scope listed above, things to be aware of:
 - **Tested on macOS and Linux.** Windows *should* work -- pyusb supports it via libusb + WinUSB binding through Zadig -- but it has not been validated.
 - **No flash cache.** Real picotool caches recent flash reads in `picoboot_memory_access::read_cached` to avoid re-fetching. We always go to the device. For typical one-shot CLI use this is invisible; for library callers doing many small reads of the same region, consider buffering at your level.
 - **No retry on transient USB errors.** A spurious `LIBUSB_ERROR_PIPE` mid-operation surfaces as a `ConnectionError` rather than being retried. picotool catches and retries some of these.
-- **No `-f` / force-reboot-running-app-into-BOOTSEL path.** Real picotool can talk to a *running* app (one that links `pico_stdio_usb`) and ask it to reboot into BOOTSEL via a USB control transfer (`RESET_REQUEST_BOOTSEL`). We don't implement that -- the device must already be in BOOTSEL when our script runs.
+- **`reboot --force` requires pico_stdio_usb.** The force-reboot path sends `RESET_REQUEST_BOOTSEL` to the device's USB reset interface, which is only present when the firmware links `pico_stdio_usb`. Firmware using UART-only stdio won't be detected.
 - **No ELF support.** The UF2 and BIN formats are supported; ELF requires a full ELF parser which is out of scope. Convert ELF to UF2 using the SDK's `elf2uf2` tool first.
 - **`info` doesn't display pin information or metadata blocks.** The `_binary_info.py` parser handles `ID_AND_STRING` and `ID_AND_INT` entry types only. Pin encoding (`PINS_WITH_FUNC`, `PINS64_WITH_FUNC`) and Picobin metadata blocks are not parsed.
 - **`save --program` relies on `BINARY_INFO_ID_RP_BINARY_END`.** If the firmware doesn't embed this binary_info entry (older SDK versions, non-SDK toolchains), `save --program` will fail. Use `save --all` or `save --range` instead.

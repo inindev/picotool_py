@@ -57,12 +57,31 @@ PC_VECTORIZE_FLASH  = 0x09
 PC_REBOOT2          = 0x0a
 PC_GET_INFO         = 0x8b
 
-# REBOOT2 flag values, from pico-sdk's boot/picoboot_constants.h
-REBOOT2_FLAG_REBOOT_TYPE_NORMAL    = 0x0   # param0 = diagnostic partition
-REBOOT2_FLAG_REBOOT_TYPE_BOOTSEL   = 0x2   # param0 = gpio_pin_number, param1 = flags
-REBOOT2_FLAG_REBOOT_TYPE_RAM_IMAGE = 0x3
-REBOOT2_FLAG_REBOOT_TO_ARM         = 0x10
-REBOOT2_FLAG_REBOOT_TO_RISCV       = 0x20
+# REBOOT2 flag values, from pico-sdk's boot/picoboot_constants.h:13-22
+REBOOT2_FLAG_REBOOT_TYPE_NORMAL       = 0x0   # param0 = diagnostic partition
+REBOOT2_FLAG_REBOOT_TYPE_BOOTSEL      = 0x2   # param0 = gpio_pin_number, param1 = flags
+REBOOT2_FLAG_REBOOT_TYPE_RAM_IMAGE    = 0x3   # param0 = image_region_base, param1 = image_region_size
+REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE = 0x4   # param0 = update_base
+REBOOT2_FLAG_REBOOT_TO_ARM            = 0x10
+REBOOT2_FLAG_REBOOT_TO_RISCV          = 0x20
+
+# USB reset interface constants from pico-sdk's pico/usb_reset_interface.h.
+# Used by --force to reboot a running device (with pico_stdio_usb) into
+# BOOTSEL without the physical button.
+RESET_INTERFACE_SUBCLASS = 0x00
+RESET_INTERFACE_PROTOCOL = 0x01
+RESET_REQUEST_BOOTSEL    = 0x01
+RESET_REQUEST_FLASH      = 0x02
+
+# PIDs for running devices with stdio_usb (not BOOTSEL).
+# picoboot_connection.h:23-24
+PRODUCT_ID_STDIO_USB       = 0x0009   # RP2350 running pico_stdio_usb
+PRODUCT_ID_RP2040_STDIO_USB = 0x000A  # RP2040 running pico_stdio_usb
+
+STDIO_USB_PIDS = {
+    PRODUCT_ID_RP2040_STDIO_USB: 'rp2040',
+    PRODUCT_ID_STDIO_USB:        'rp2350',
+}
 
 # picoboot.h:119-123 -- exclusive access modes
 NOT_EXCLUSIVE       = 0
@@ -662,3 +681,98 @@ def find_device(serial=None):
 
     dev = candidates[0]
     return dev, BOOTSEL_PIDS[dev.idProduct]
+
+
+def find_stdio_usb_device(serial=None):
+    """Find an RP2xxx running pico_stdio_usb (not in BOOTSEL).
+
+    Returns (dev, family_string) or raises ConnectionError.
+
+    Mirrors the dr_vidpid_stdio_usb device classification in
+    picoboot_connection.c:90-94. The device must have VID 0x2e8a
+    with a stdio_usb PID, and must expose the vendor-class reset
+    interface (class 0xFF, subclass 0x00, protocol 0x01)."""
+    try:
+        candidates = list(usb.core.find(
+            find_all=True,
+            idVendor=VENDOR_ID_RASPBERRY_PI,
+            custom_match=lambda d: d.idProduct in STDIO_USB_PIDS,
+        ))
+    except usb.core.NoBackendError:
+        raise ConnectionError(-1, 'libusb backend not found')
+
+    if serial is not None:
+        candidates = [d for d in candidates if _get_serial(d) == serial]
+
+    # Verify the reset interface is present (picoboot_connection.c:146-152)
+    verified = []
+    for dev in candidates:
+        try:
+            cfg = dev.get_active_configuration()
+        except usb.core.USBError:
+            continue
+        for intf in cfg:
+            if intf.bInterfaceClass == 0xFF and \
+               intf.bInterfaceSubClass == RESET_INTERFACE_SUBCLASS and \
+               intf.bInterfaceProtocol == RESET_INTERFACE_PROTOCOL:
+                verified.append((dev, intf.bInterfaceNumber))
+                break
+
+    if not verified:
+        raise ConnectionError(-1,
+            'No RP2040/RP2350 with stdio_usb found. '
+            'Device must be running firmware that links pico_stdio_usb.')
+    if len(verified) > 1:
+        sers = ', '.join(_get_serial(d) or '?' for d, _ in verified)
+        raise ConnectionError(-1,
+            'Multiple stdio_usb devices found (%s); specify --serial.' % sers)
+
+    dev, intf_num = verified[0]
+    return dev, STDIO_USB_PIDS[dev.idProduct], intf_num
+
+
+def force_reboot_to_bootsel(dev, intf_num, disable_mask=1):
+    """Send RESET_REQUEST_BOOTSEL to a running pico_stdio_usb device.
+
+    This reboots the device into BOOTSEL mode without the physical
+    button. The device must expose the vendor-class reset interface.
+
+    disable_mask=1 disables the MSC (mass storage) interface after
+    reboot, matching main.cpp:8823.
+
+    Mirrors reboot_device() in main.cpp:8486-8517."""
+    # bmRequestType: class request to interface (0x21)
+    # main.cpp:8502-8503
+    bm = LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE
+    try:
+        if dev.is_kernel_driver_active(intf_num):
+            dev.detach_kernel_driver(intf_num)
+    except (NotImplementedError, usb.core.USBError):
+        pass
+    usb.util.claim_interface(dev, intf_num)
+    try:
+        dev.ctrl_transfer(
+            bmRequestType=bm,
+            bRequest=RESET_REQUEST_BOOTSEL,
+            wValue=disable_mask,
+            wIndex=intf_num,
+            data_or_wLength=0,
+            timeout=2000,
+        )
+    except usb.core.USBError:
+        # Device may reset before the transfer completes; not an error.
+        # main.cpp:8508-8512 (commented-out error check)
+        pass
+    finally:
+        try:
+            usb.util.release_interface(dev, intf_num)
+        except Exception:
+            pass
+        try:
+            usb.util.dispose_resources(dev)
+        except Exception:
+            pass
+
+
+# For bmRequestType: class request type (0x20)
+LIBUSB_REQUEST_TYPE_CLASS = 0x20
