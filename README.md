@@ -273,7 +273,7 @@ picotool_py/
 |-- _binary_info.py    # binary_info metadata parser
 |-- picotool_lib.py    # high-level Picotool class
 |-- picotool.py        # CLI veneer (argparse + dispatch + ProgressBar)
-|-- test/              # integration tests (require real hardware + real picotool)
+|-- tests/             # test suite (offline + hardware; run via tests/run_all.py)
 `-- pyenv/             # auto-created on first run if system pyusb is missing; gitignored
 ```
 
