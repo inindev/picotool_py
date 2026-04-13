@@ -48,6 +48,12 @@ BINARY_INFO_TYPE_BLOCK_DEVICE                   = 7
 BINARY_INFO_TYPE_PINS_WITH_FUNC                 = 8
 BINARY_INFO_TYPE_PINS_WITH_NAME                 = 9
 BINARY_INFO_TYPE_NAMED_GROUP                    = 10
+BINARY_INFO_TYPE_PINS64_WITH_FUNC               = 13
+BINARY_INFO_TYPE_PINS64_WITH_NAME               = 14
+
+# structure.h:124-125 -- pin encoding type identifiers
+BI_PINS_ENCODING_RANGE = 1
+BI_PINS_ENCODING_MULTI = 2
 
 # structure.h:48 -- tag for Raspberry Pi defined entries
 # BINARY_INFO_MAKE_TAG('R','P') = (ord('P') << 8) | ord('R') = 0x5052
@@ -267,6 +273,9 @@ class BinaryInfo:
         sdk_version         -- BINARY_INFO_ID_RP_SDK_VERSION
         boot2_name          -- BINARY_INFO_ID_RP_BOOT2_NAME
         binary_end          -- BINARY_INFO_ID_RP_BINARY_END (uint32, flash address)
+        pins                -- dict of {pin_number: [function_name, ...]}
+                               from PINS_WITH_FUNC / PINS64_WITH_FUNC /
+                               PINS_WITH_NAME / PINS64_WITH_NAME entries
     """
 
     def __init__(self):
@@ -281,6 +290,93 @@ class BinaryInfo:
         self.sdk_version = None
         self.boot2_name = None
         self.binary_end = 0
+        self.pins = {}  # {pin_number: [function_name, ...]}
+
+
+# ---------------------------------------------------------------------------
+#  Pin function name tables -- direct port of main.cpp:143-169.
+#  Indexed by [function_number][pin_number].
+# ---------------------------------------------------------------------------
+
+# RP2040: 10 functions x 30 pins (main.cpp:143-154)
+_PIN_FUNCS_RP2040 = [
+    [""]*30,
+    ["SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI1 RX","SPI1 CSn"],
+    ["UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART0 TX","UART0 RX"],
+    ["I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL","I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL","I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL","I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL","I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL","I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL","I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL","I2C0 SDA","I2C0 SCL"],
+    ["PWM0 A","PWM0 B","PWM1 A","PWM1 B","PWM2 A","PWM2 B","PWM3 A","PWM3 B","PWM4 A","PWM4 B","PWM5 A","PWM5 B","PWM6 A","PWM6 B","PWM7 A","PWM7 B","PWM0 A","PWM0 B","PWM1 A","PWM1 B","PWM2 A","PWM2 B","PWM3 A","PWM3 B","PWM4 A","PWM4 B","PWM5 A","PWM5 B","PWM6 A","PWM6 B"],
+    ["SIO"]*30,
+    ["PIO0"]*30,
+    ["PIO1"]*30,
+    ["","","","","","","","","","","","","","","","","","","","","CLOCK GPIN0","CLOCK GPOUT0","CLOCK GPIN1","CLOCK GPOUT1","CLOCK GPOUT2","CLOCK GPOUT3","","","",""],
+    ["USB OVCUR DET","USB VBUS DET","USB VBUS EN"]*10,
+]
+
+# RP2350: 12 functions x 48 pins (main.cpp:156-169)
+_PIN_FUNCS_RP2350 = [
+    ["JTAG TCK","JTAG TMS","JTAG TDI","JTAG TDO","","","","","","","","","HSTX0","HSTX1","HSTX2","HSTX3","HSTX4","HSTX5","HSTX6","HSTX7"]+[""]*28,
+    ["SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI0 RX","SPI0 CSn","SPI0 SCK","SPI0 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX","SPI1 RX","SPI1 CSn","SPI1 SCK","SPI1 TX"],
+    ["UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART0 TX","UART0 RX","UART0 CTS","UART0 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART1 TX","UART1 RX","UART1 CTS","UART1 RTS","UART0 TX","UART0 RX","UART0 CTS","UART0 RTS"],
+    ["I2C0 SDA","I2C0 SCL","I2C1 SDA","I2C1 SCL"]*12,
+    ["PWM0 A","PWM0 B","PWM1 A","PWM1 B","PWM2 A","PWM2 B","PWM3 A","PWM3 B","PWM4 A","PWM4 B","PWM5 A","PWM5 B","PWM6 A","PWM6 B","PWM7 A","PWM7 B","PWM0 A","PWM0 B","PWM1 A","PWM1 B","PWM2 A","PWM2 B","PWM3 A","PWM3 B","PWM4 A","PWM4 B","PWM5 A","PWM5 B","PWM6 A","PWM6 B","PWM7 A","PWM7 B","PWM8 A","PWM8 B","PWM9 A","PWM9 B","PWM10 A","PWM10 B","PWM11 A","PWM11 B","PWM8 A","PWM8 B","PWM9 A","PWM9 B","PWM10 A","PWM10 B","PWM11 A","PWM11 B"],
+    ["SIO"]*48,
+    ["PIO0"]*48,
+    ["PIO1"]*48,
+    ["PIO2"]*48,
+    ["XIP CS1","CORESIGHT TRACECLK","CORESIGHT TRACEDATA0","CORESIGHT TDATA1","CORESIGHT TDATA2","CORESIGHT TDATA3","","","XIP CS1","","","","CLK GPIN","CLK GPOUT","CLK GPIN","CLK GPOUT","","","","XIP CS1","CLK GPIN","CLK GPOUT","CLK GPIN","CLK GPOUT","CLK GPOUT","CLK GPOUT"]+[""]*21+["XIP CS1"],
+    ["USB OVCUR DET","USB VBUS DET","USB VBUS EN"]*16,
+    ["","","UART0 TX","UART0 RX","","","UART1 TX","UART1 RX","","","UART1 TX","UART1 RX","","","UART0 TX","UART0 RX","","","UART0 TX","UART0 RX","","","UART1 TX","UART1 RX","","","UART1 TX","UART1 RX","","","UART0 TX","UART0 RX","","","UART0 TX","UART0 RX","","","UART1 TX","UART1 RX","","","UART1 TX","UART1 RX","","","UART0 TX","UART0 RX"],
+]
+
+
+def _decode_pins_with_func(encoding, is_64bit=False):
+    """Decode a PINS_WITH_FUNC or PINS64_WITH_FUNC encoding into
+    (pin_mask, function_number).
+
+    Mirrors do_pins_func in main.cpp:2510-2544.
+
+    Returns (mask, func) where mask is a bitmask of GPIO pin numbers
+    and func is the function select index into the pin_functions table.
+    """
+    enc_type = encoding & 0x7          # bits [2:0]
+
+    if is_64bit:
+        bpp, pm, fp = 8, 0xFF, 8      # 64-bit: 8 bits/pin, mask 0xFF, first pin at bit 8
+        func = (encoding >> 3) & 0x1F  # 5-bit function
+        max_pins = 7
+    else:
+        bpp, pm, fp = 5, 0x1F, 7      # 32-bit: 5 bits/pin, mask 0x1F, first pin at bit 7
+        func = (encoding >> 3) & 0xF   # 4-bit function
+        max_pins = 5
+
+    mask = 0
+    if enc_type == BI_PINS_ENCODING_RANGE:
+        plo = (encoding >> fp) & pm
+        phi = (encoding >> (fp + bpp)) & pm
+        for i in range(plo, phi + 1):
+            mask |= 1 << i
+
+    elif enc_type == BI_PINS_ENCODING_MULTI:
+        last = -1
+        work = encoding >> fp
+        for _ in range(max_pins):
+            cur = work & pm
+            mask |= 1 << cur
+            if cur == last:
+                break
+            last = cur
+            work >>= bpp
+
+    return mask, func
+
+
+def _pin_func_name(func, pin, family):
+    """Look up the function name for a pin number and function select.
+    Returns the name string, or '' if unknown."""
+    table = _PIN_FUNCS_RP2350 if family == 'rp2350' else _PIN_FUNCS_RP2040
+    if func < len(table) and pin < len(table[func]):
+        return table[func][pin]
+    return ''
 
 
 def parse_binary_info(buf, base_addr, family='rp2350'):
@@ -366,5 +462,76 @@ def parse_binary_info(buf, base_addr, family='rp2350'):
                 info.sdk_version = value
             elif eid == BINARY_INFO_ID_RP_BOOT2_NAME:
                 info.boot2_name = value
+
+        # main.cpp:2618-2620 -- PINS_WITH_FUNC (32-bit encoding)
+        elif etype == BINARY_INFO_TYPE_PINS_WITH_FUNC:
+            # structure.h:127-132 -- core(4) + pin_encoding(4) = 8 bytes
+            entry_raw = _buf_read(buf, base_addr, entry_addr, 8)
+            if entry_raw is None:
+                continue
+            encoding, = struct.unpack_from('<I', entry_raw, 4)
+            mask, func = _decode_pins_with_func(encoding, is_64bit=False)
+            for pin in range(64):
+                if mask & (1 << pin):
+                    name = _pin_func_name(func, pin, family)
+                    if name:
+                        info.pins.setdefault(pin, []).append(name)
+
+        # main.cpp:2622-2624 -- PINS64_WITH_FUNC (64-bit encoding)
+        elif etype == BINARY_INFO_TYPE_PINS64_WITH_FUNC:
+            # structure.h:134-139 -- core(4) + pin_encoding(8) = 12 bytes
+            entry_raw = _buf_read(buf, base_addr, entry_addr, 12)
+            if entry_raw is None:
+                continue
+            encoding, = struct.unpack_from('<Q', entry_raw, 4)
+            mask, func = _decode_pins_with_func(encoding, is_64bit=True)
+            for pin in range(64):
+                if mask & (1 << pin):
+                    name = _pin_func_name(func, pin, family)
+                    if name:
+                        info.pins.setdefault(pin, []).append(name)
+
+        # main.cpp:2621 -- PINS_WITH_NAME (32-bit mask + label)
+        elif etype == BINARY_INFO_TYPE_PINS_WITH_NAME:
+            # structure.h:141-145 -- core(4) + pin_mask(4) + label_ptr(4) = 12
+            entry_raw = _buf_read(buf, base_addr, entry_addr, 12)
+            if entry_raw is None:
+                continue
+            pin_mask, label_ptr = struct.unpack_from('<II', entry_raw, 4)
+            label_addr = _remap_addr(label_ptr, copy_table)
+            if label_addr == 0:
+                continue
+            label = _buf_read_string(buf, base_addr, label_addr)
+            if label is None:
+                continue
+            # main.cpp:2680-2688 -- pipe-separated labels for consecutive pins
+            parts = label.split('|')
+            part_idx = 0
+            for pin in range(32):
+                if pin_mask & (1 << pin):
+                    if part_idx < len(parts) and parts[part_idx]:
+                        info.pins.setdefault(pin, []).append(parts[part_idx])
+                    part_idx += 1
+
+        # PINS64_WITH_NAME (64-bit mask + label)
+        elif etype == BINARY_INFO_TYPE_PINS64_WITH_NAME:
+            # structure.h:147-151 -- core(4) + pin_mask(8) + label_ptr(4) = 16
+            entry_raw = _buf_read(buf, base_addr, entry_addr, 16)
+            if entry_raw is None:
+                continue
+            pin_mask, label_ptr = struct.unpack_from('<QI', entry_raw, 4)
+            label_addr = _remap_addr(label_ptr, copy_table)
+            if label_addr == 0:
+                continue
+            label = _buf_read_string(buf, base_addr, label_addr)
+            if label is None:
+                continue
+            parts = label.split('|')
+            part_idx = 0
+            for pin in range(64):
+                if pin_mask & (1 << pin):
+                    if part_idx < len(parts) and parts[part_idx]:
+                        info.pins.setdefault(pin, []).append(parts[part_idx])
+                    part_idx += 1
 
     return info

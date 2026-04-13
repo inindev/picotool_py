@@ -39,11 +39,16 @@ from _wire import (
     FLASH_SECTOR_ERASE_SIZE,
     FLASH_START,
     PAGE_SIZE,
+    PICOBOOT_GET_INFO_SYS,
     REBOOT2_FLAG_REBOOT_TO_ARM,
     REBOOT2_FLAG_REBOOT_TO_RISCV,
     REBOOT2_FLAG_REBOOT_TYPE_BOOTSEL,
     REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE,
     REBOOT2_FLAG_REBOOT_TYPE_NORMAL,
+    SYS_INFO_BOOT_INFO,
+    SYS_INFO_CHIP_INFO,
+    SYS_INFO_CPU_INFO,
+    SYS_INFO_FLASH_DEV_INFO,
     calculate_chunk_size,
     find_device,
     find_stdio_usb_device,
@@ -306,6 +311,72 @@ class Picotool:
             # BIN files loaded at FLASH_START by convention
             return parse_binary_info(data, FLASH_START, 'rp2350')
 
+    def device_info(self):
+        """Query device information via PC_GET_INFO (RP2350 only).
+
+        Returns a dict with chip, CPU, flash, and boot state info,
+        or None if the device doesn't support PC_GET_INFO (RP2040).
+
+        Mirrors the -d/--device flag of info_command, main.cpp:3741-3812.
+        Uses PICOBOOT_GET_INFO_SYS with SYS_INFO_CHIP_INFO,
+        SYS_INFO_CPU_INFO, SYS_INFO_FLASH_DEV_INFO, SYS_INFO_BOOT_INFO.
+        """
+        self.open()
+        flags = (SYS_INFO_CHIP_INFO | SYS_INFO_CPU_INFO |
+                 SYS_INFO_FLASH_DEV_INFO | SYS_INFO_BOOT_INFO)
+        try:
+            words = self.conn.get_info(PICOBOOT_GET_INFO_SYS, flags)
+        except (CommandFailure, ConnectionError):
+            return None  # RP2040 doesn't support PC_GET_INFO
+
+        # Response: [word_count, included_flags, ...fields]
+        if len(words) < 2:
+            return None
+        included = words[1]
+        result = {}
+        idx = 2
+
+        # main.cpp:3756-3778 -- chip info (3 words)
+        if included & SYS_INFO_CHIP_INFO and idx + 3 <= len(words):
+            package_id = words[idx]
+            device_id_lo = words[idx + 1]
+            device_id_hi = words[idx + 2]
+            # main.cpp:3761-3775 -- decode package and revision
+            _PACKAGES = {0: 'QFN80', 1: 'QFN60', 2: 'QFN48', 3: 'QFN33'}
+            _REVISIONS = {1: 'A1', 2: 'A2', 3: 'A3', 4: 'A4'}
+            result['package'] = _PACKAGES.get(package_id >> 4, 'unknown')
+            result['revision'] = _REVISIONS.get(package_id & 0xF, 'unknown')
+            result['chipid'] = '0x%08x%08x' % (device_id_hi, device_id_lo)
+            idx += 3
+
+        # main.cpp:3784-3793 -- CPU info (1 word)
+        if included & SYS_INFO_CPU_INFO and idx + 1 <= len(words):
+            cpu_word = words[idx]
+            cpu_type = cpu_word & 0xFF
+            supported = (cpu_word >> 8) & 0xFF
+            _CPU_NAMES = {0: 'ARM', 1: 'RISC-V'}
+            result['cpu'] = _CPU_NAMES.get(cpu_type, 'unknown')
+            cpus = []
+            if supported & 1: cpus.append('ARM')
+            if supported & 2: cpus.append('RISC-V')
+            result['available_cpus'] = cpus
+            idx += 1
+
+        # main.cpp:3787-3790 -- flash dev info (1 word)
+        if included & SYS_INFO_FLASH_DEV_INFO and idx + 1 <= len(words):
+            result['flash_devinfo'] = '0x%04x' % (words[idx] & 0xFFFF)
+            idx += 1
+
+        # main.cpp:3822-3830 -- boot info (4 words)
+        if included & SYS_INFO_BOOT_INFO and idx + 4 <= len(words):
+            result['boot_type'] = words[idx]
+            result['boot_diagnostic'] = words[idx + 1]
+            result['reboot_param0'] = words[idx + 2]
+            result['reboot_param1'] = words[idx + 3]
+            idx += 4
+
+        return result
+
     # -- save extended modes ------------------------------------------------
 
     def save_program(self, file_path, file_type=None, family_id=None,
@@ -491,11 +562,15 @@ class Picotool:
                 'range 0x%08x-0x%08x not all in flash' %
                 (range_from, range_to))
 
-    def write(self, addr, data, progress=None):
+    def write(self, addr, data, update=False, progress=None):
         """Write `data` bytes to flash starting at `addr`.
 
         Erases the surrounding sectors as needed (with zero-fill for
         any front/back partial sector), then writes the data.
+
+        `update` -- if True, read each sector before writing and skip
+                    if already identical. Mirrors C++ -u/--update flag
+                    (main.cpp:4870-4874).
 
         progress(current, total): write-phase callback.
 
@@ -535,9 +610,15 @@ class Picotool:
             assert len(buf) == aligned_len, \
                 'pad mismatch: %d vs %d' % (len(buf), aligned_len)
 
-            # main.cpp:4876-4878 -- erase + write
-            self.conn.flash_erase(aligned_from, aligned_len)
-            self.conn.write(aligned_from, buf)
+            # main.cpp:4869-4878 -- skip if already identical (--update)
+            skip = False
+            if update:
+                device_buf = self.conn.read_memory(aligned_from, aligned_len)
+                skip = (buf == device_buf)
+
+            if not skip:
+                self.conn.flash_erase(aligned_from, aligned_len)
+                self.conn.write(aligned_from, buf)
 
             base = read_to
             if progress is not None:
@@ -547,29 +628,35 @@ class Picotool:
         return len(data)
 
     def load(self, file_path, offset=FLASH_START, file_type=None,
-             family_id=None, execute=False, progress=None):
+             family_id=None, execute=False, update=False,
+             no_overwrite=False, progress=None):
         """Load a BIN or UF2 file into flash.
 
         For BIN files, writes starting at `offset` (default FLASH_START).
         For UF2 files, uses the target addresses embedded in the UF2
         blocks; the `offset` parameter is ignored.
 
-        `file_type` -- 'bin' or 'uf2'; auto-detected from extension
-                       if None. Mirrors C++ -t/--type flag (main.cpp:703).
-        `family_id` -- for UF2 files, restrict to this family ID.
-                       Mirrors C++ --family flag (main.cpp:849-850).
-        `execute`   -- if True, reboot the device into the loaded program
-                       after writing. Mirrors C++ -x/--execute flag
-                       (main.cpp:4929-4966).
+        `file_type`    -- 'bin' or 'uf2'; auto-detected from extension
+                          if None. Mirrors C++ -t/--type (main.cpp:703).
+        `family_id`    -- for UF2 files, restrict to this family ID.
+                          Mirrors C++ --family (main.cpp:849-850).
+        `execute`      -- if True, reboot into the loaded program after
+                          writing. Mirrors C++ -x/--execute (main.cpp:4929).
+        `update`       -- if True, skip sectors that already match.
+                          Mirrors C++ -u/--update (main.cpp:4870).
+        `no_overwrite` -- if True, refuse to write if flash already
+                          contains a program (via binary_info).
+                          Mirrors C++ -n/--no-overwrite (main.cpp:4779).
 
         Returns the number of bytes loaded. Raises PicotoolError on
         argument errors.
 
-        Mirrors the write path of load_guts, main.cpp:4845-4888.
+        Mirrors the write path of load_guts, main.cpp:4774-4888.
         """
         if file_type is None:
             file_type = _file_type_from_ext(file_path)
 
+        # Parse the file to get load address and data
         if file_type == 'uf2':
             try:
                 valid = None
@@ -579,12 +666,35 @@ class Picotool:
                     file_path, valid_families=valid)
             except UF2Error as e:
                 raise PicotoolError('UF2 parse error: %s' % e)
-            n = self.write(addr_min, bytes(image), progress=progress)
+            load_data = bytes(image)
             load_addr = addr_min
         else:
-            file_data = self._read_bin_file(file_path)
-            n = self.write(offset, file_data, progress=progress)
+            load_data = self._read_bin_file(file_path)
             load_addr = offset
+
+        # main.cpp:4779-4821 -- no-overwrite check
+        if no_overwrite:
+            self.open()
+            info = self.info()
+            if info is not None and info.binary_end:
+                # Existing program range: FLASH_START to binary_end
+                existing_end = info.binary_end
+                new_start = load_addr
+                new_end = load_addr + len(load_data)
+                # Check intersection (main.cpp:4812)
+                if new_start < existing_end and new_end > FLASH_START:
+                    raise PicotoolError(
+                        '-n: loaded data range 0x%08x-0x%08x clashes '
+                        'with existing program 0x%08x-0x%08x' %
+                        (new_start, new_end, FLASH_START, existing_end))
+            else:
+                # Can't determine existing program extent
+                raise PicotoolError(
+                    '-n: size/presence of existing flash binary could '
+                    'not be detected; aborting')
+
+        n = self.write(load_addr, load_data, update=update,
+                       progress=progress)
 
         if execute:
             self._execute_loaded(load_addr)

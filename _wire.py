@@ -65,6 +65,22 @@ REBOOT2_FLAG_REBOOT_TYPE_FLASH_UPDATE = 0x4   # param0 = update_base
 REBOOT2_FLAG_REBOOT_TO_ARM            = 0x10
 REBOOT2_FLAG_REBOOT_TO_RISCV          = 0x20
 
+# PC_GET_INFO type constants, from pico-sdk's boot/picoboot_constants.h:32-35
+PICOBOOT_GET_INFO_SYS              = 1
+PICOBOOT_GET_INFO_PARTITION_TABLE  = 2
+PICOBOOT_GET_INFO_UF2_TARGET_PARTITION = 3
+PICOBOOT_GET_INFO_UF2_STATUS      = 4
+
+# SYS_INFO flags, from pico-sdk's boot/bootrom_constants.h:234-246.
+# Passed in dParams[0] of PC_GET_INFO with type=SYS to select fields.
+SYS_INFO_CHIP_INFO      = 0x0001  # 3 words: package_id, device_id_lo, device_id_hi
+SYS_INFO_CRITICAL       = 0x0002  # 1 word: chip-specific critical bits
+SYS_INFO_CPU_INFO       = 0x0004  # 1 word: cpu_type, supported_cpu_type_bitfield
+SYS_INFO_FLASH_DEV_INFO = 0x0008  # 1 word: same as FLASH_DEVINFO OTP row
+SYS_INFO_BOOT_RANDOM    = 0x0010  # 4 words: random boot value
+SYS_INFO_NONCE          = 0x0020  # 2 words: nonce (LSB first)
+SYS_INFO_BOOT_INFO      = 0x0040  # 4 words: boot_info, diagnostic, param0, param1
+
 # USB reset interface constants from pico-sdk's pico/usb_reset_interface.h.
 # Used by --force to reboot a running device (with pico_stdio_usb) into
 # BOOTSEL without the physical button.
@@ -612,6 +628,27 @@ class Connection:
             self._wrap_call(lambda: self._picoboot_cmd(PC_REBOOT2, args=args))
         except (ConnectionError, CommandFailure):
             pass
+
+    def get_info(self, info_type, flags=0):
+        """Send PC_GET_INFO and return the response as a list of uint32.
+
+        `info_type` -- PICOBOOT_GET_INFO_SYS, etc.
+        `flags`     -- for SYS type, a bitmask of SYS_INFO_* fields.
+
+        The response starts with [word_count, included_flags, ...data].
+        Returns the full word list. Raises CommandFailure on RP2040
+        (which doesn't support PC_GET_INFO).
+
+        Mirrors picoboot_get_info (picoboot_connection.c:183-194)."""
+        # picoboot_get_info_cmd: bType(1) + bParam(1) + wParam(2) + dParams[3](12) = 16
+        args = struct.pack('<BBH III', info_type, 0, 0, flags, 0, 0)
+        data = self._wrap_call(lambda: self._picoboot_cmd(
+            PC_GET_INFO, args=args, data_in_len=256))
+        # Response is a sequence of uint32 words
+        num_words = len(data) // 4
+        if num_words < 2:
+            raise CommandFailure(PICOBOOT_INVALID_DATA)
+        return list(struct.unpack_from('<%dI' % num_words, data, 0))
 
     # picoboot_memory_access::read_raw, main.cpp:2150-2201 (flash path).
     # We don't implement the RP2040 ROM trick or the unreadable-rom

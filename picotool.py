@@ -165,6 +165,14 @@ def _print_info(info):
     if info.binary_end:
         print(' binary end:    0x%08x' % info.binary_end)
 
+    # main.cpp:3663-3682 -- pin display (Fixed Pin Information)
+    if info.pins:
+        print()
+        print('Fixed Pin Information')
+        for pin in sorted(info.pins.keys()):
+            funcs = sorted(info.pins[pin])
+            print(' %-16s%s' % ('%d:' % pin, ', '.join(funcs)))
+
 
 # ---------------------------------------------------------------------------
 #  CLI dispatch -- each function corresponds to one subcommand and is a
@@ -267,6 +275,8 @@ def cli_load(args):
                                      file_type=args.type,
                                      family_id=args.family_id,
                                      execute=args.execute,
+                                     update=args.update,
+                                     no_overwrite=args.no_overwrite,
                                      progress=prog),
             )
             if args.execute:
@@ -435,6 +445,13 @@ def main():
     p_load.add_argument('--family', dest='family_id', type=parse_family_id,
                         default=None,
                         help='Specify the family ID of the UF2 file to load')
+    # main.cpp:855 -- skip unchanged sectors
+    p_load.add_argument('-u', '--update', action='store_true',
+                        help='Skip writing sectors that already match')
+    # main.cpp:853 -- no-overwrite safety check
+    p_load.add_argument('-n', '--no-overwrite', dest='no_overwrite',
+                        action='store_true',
+                        help='Refuse to write if flash already contains a program')
 
     # -- verify subcommand -------------------------------------------------
     # Mirrors verify_command (main.cpp:789-810).

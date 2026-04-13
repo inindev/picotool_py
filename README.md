@@ -22,9 +22,9 @@ The implemented commands are byte-equivalent to the C++ tool on the same hardwar
 | `reboot -f` | `picotool reboot --force` | Force-reboot a running device (with pico_stdio_usb) into BOOTSEL without the physical button |
 | `reboot -c arm\|riscv` | `picotool reboot --cpu arm\|riscv` | Select CPU architecture on RP2350 |
 
-Additional CLI flags: `--ser` (device serial filter), `save --verify`, `save --family`, `load --type`, `load --family`, `reboot --diagnostic`.
+Additional CLI flags: `--ser` (device serial filter), `save --verify`, `save --family`, `load --type`, `load --family`, `load --update`, `load --no-overwrite`, `reboot --diagnostic`.
 
-**Out of scope** (use real picotool if you need these): ELF input, partition tables, signed images, `--no-overwrite`, `--update`, OTP read/write, pin info display, `config`, `seal`, `encrypt`, `link`.
+**Out of scope** (use real picotool if you need these): ELF input, partition tables, signed images, OTP read/write, `config`, `seal`, `encrypt`, `link`.
 
 ## Requirements
 
@@ -217,8 +217,9 @@ if info:
 | `save_all(file_path, file_type=None, family_id=None, progress=None)` | bytes written | Save entire flash. BIN or UF2 |
 | `erase(addr, size, progress=None)` | bytes erased | Erase sectors covering a range (auto-rounds to 4 KB) |
 | `erase_all(progress=None)` | bytes erased | Erase entire flash (detects size) |
-| `write(addr, data, progress=None)` | bytes written | Write raw bytes to flash (erases sectors as needed) |
-| `load(file_path, offset=FLASH_START, file_type=None, family_id=None, execute=False, progress=None)` | bytes loaded | Load a BIN or UF2 file; `execute=True` reboots into it |
+| `write(addr, data, update=False, progress=None)` | bytes written | Write raw bytes to flash; `update=True` skips unchanged sectors |
+| `load(file_path, offset=FLASH_START, file_type=None, family_id=None, execute=False, update=False, no_overwrite=False, progress=None)` | bytes loaded | Load a BIN or UF2 file; `execute` reboots into it, `update` skips matching sectors, `no_overwrite` refuses if program exists |
+| `device_info()` | dict or None | Query chip, CPU, flash, boot state via PC_GET_INFO (RP2350 only) |
 | `verify(file_path, offset=FLASH_START, file_type=None, progress=None)` | bytes verified | Verify flash matches a file |
 | `verify_bytes(addr, expected, progress=None)` | bytes verified | Verify flash matches raw bytes |
 | `guess_flash_size()` | int | Detect flash size via address mirroring (0 if erased) |
@@ -321,7 +322,7 @@ Within the scope listed above, things to be aware of:
 - **No retry on transient USB errors.** A spurious `LIBUSB_ERROR_PIPE` mid-operation surfaces as a `ConnectionError` rather than being retried. picotool catches and retries some of these.
 - **`reboot --force` requires pico_stdio_usb.** The force-reboot path sends `RESET_REQUEST_BOOTSEL` to the device's USB reset interface, which is only present when the firmware links `pico_stdio_usb`. Firmware using UART-only stdio won't be detected.
 - **No ELF support.** The UF2 and BIN formats are supported; ELF requires a full ELF parser which is out of scope. Convert ELF to UF2 using the SDK's `elf2uf2` tool first.
-- **`info` doesn't display pin information or metadata blocks.** The `_binary_info.py` parser handles `ID_AND_STRING` and `ID_AND_INT` entry types only. Pin encoding (`PINS_WITH_FUNC`, `PINS64_WITH_FUNC`) and Picobin metadata blocks are not parsed.
+- **`info` doesn't display metadata blocks.** The `_binary_info.py` parser handles `ID_AND_STRING`, `ID_AND_INT`, and `PINS_WITH_FUNC`/`PINS64_WITH_FUNC`/`PINS_WITH_NAME` entries. Picobin metadata blocks (`-m` flag) are not parsed.
 - **`save --program` relies on `BINARY_INFO_ID_RP_BINARY_END`.** If the firmware doesn't embed this binary_info entry (older SDK versions, non-SDK toolchains), `save --program` will fail. Use `save --all` or `save --range` instead.
 - **`guess_flash_size()` uses address mirroring heuristic.** It reads at decreasing power-of-2 offsets and looks for data that differs from the start of flash. This matches the C++ algorithm (main.cpp:2840-2860) but can be fooled by erased flash (returns 0) or unusual flash layouts.
 - **Subprocess invocations pay USB enumeration cost per call.** If you're shelling out to `picotool.py` repeatedly from another script, prefer the library API (`from picotool_lib import Picotool`) and reuse a single connection. Each shell-out costs ~100-300 ms of device enumeration.
